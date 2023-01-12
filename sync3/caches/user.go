@@ -3,6 +3,7 @@ package caches
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"sync"
 
 	lru "github.com/hashicorp/golang-lru"
@@ -45,7 +46,9 @@ type UserRoomData struct {
 }
 
 func NewUserRoomData() UserRoomData {
-	l, _ := lru.New(64) // 64 tokens least recently used evicted
+	l, _ := lru.NewWithEvict(64, func(key interface{}, value interface{}) {
+		logger.Debug().Interface("key", key).Msg("evicted key")
+	}) // 64 tokens least recently used evicted
 	return UserRoomData{
 		PrevBatches: l,
 		Spaces:      make(map[string]struct{}),
@@ -60,8 +63,11 @@ func (u UserRoomData) PrevBatch() (string, bool) {
 	}
 	eventID := gjson.GetBytes(u.Timeline[0], "event_id").Str
 	lastEventID := gjson.GetBytes(u.Timeline[len(u.Timeline)-1], "event_id").Str
-	val, ok := u.PrevBatches.Get(eventID + lastEventID)
+	key := eventID + lastEventID
+	val, ok := u.PrevBatches.Get(key)
 	if !ok {
+		_, file, no, _ := runtime.Caller(1)
+		logger.Debug().Str("key", key).Int("line", no).Str("caller2", file).Msg("unable to find event in prev_batches, returning empty prev_batch")
 		return "", false
 	}
 	return val.(string), true
@@ -194,7 +200,7 @@ func NewUserCache(userID string, globalCache *GlobalCache, store *state.Storage,
 	return uc
 }
 
-func (c *UserCache) Subsribe(ucl UserCacheListener) (id int) {
+func (c *UserCache) Subscribe(ucl UserCacheListener) (id int) {
 	c.listenersMu.Lock()
 	defer c.listenersMu.Unlock()
 	id = c.id
@@ -296,13 +302,15 @@ func (c *UserCache) LazyLoadTimelines(loadPos int64, roomIDs []string, maxTimeli
 			if len(timeline) == maxTimelineEvents || createEventExists {
 				if !createEventExists && len(timeline) > 0 {
 					// fetch a prev batch token for the earliest event
-					_, ok := urd.PrevBatch()
+					token, ok := urd.PrevBatch()
+					logger.Debug().Str("prev_batch", token).Str("room_id", roomID).Int("timeline_events", int(len(timeline))).Msg("prev_batch from timeline")
 					if !ok {
 						eventID := gjson.ParseBytes(timeline[0]).Get("event_id").Str
 						prevBatch, err := c.store.EventsTable.SelectClosestPrevBatchByID(roomID, eventID)
 						if err != nil {
 							logger.Err(err).Str("room", roomID).Str("event_id", eventID).Msg("failed to get prev batch token for room")
 						}
+						logger.Debug().Str("prev_batch", prevBatch).Str("event_id", eventID).Str("room_id", roomID).Msg("prev_batch from timeline (updated)")
 						urd.SetPrevBatch(eventID, prevBatch)
 					}
 				}
@@ -314,6 +322,9 @@ func (c *UserCache) LazyLoadTimelines(loadPos int64, roomIDs []string, maxTimeli
 				u.Timeline = timeline
 				u.PrevBatches = urd.PrevBatches
 				result[roomID] = u
+				prevBatch, _ := u.PrevBatch()
+				prevBatch2, _ := urd.PrevBatch()
+				logger.Debug().Str("prev_batch", prevBatch).Str("prev_batch2", prevBatch2).Str("room_id", roomID).Msg("prev_batch from timeline (result)")
 			} else {
 				// refetch from the db
 				lazyRoomIDs = append(lazyRoomIDs, roomID)
@@ -326,8 +337,10 @@ func (c *UserCache) LazyLoadTimelines(loadPos int64, roomIDs []string, maxTimeli
 		}
 	}
 	if len(lazyRoomIDs) == 0 {
+		logger.Debug().Msg("nothing to lazy load, returning")
 		return result
 	}
+	logger.Debug().Strs("roomIDs", lazyRoomIDs).Msg("lazy loading rooms")
 	roomIDToEvents, roomIDToPrevBatch, err := c.store.LatestEventsInRooms(c.UserID, lazyRoomIDs, loadPos, maxTimelineEvents)
 	if err != nil {
 		logger.Err(err).Strs("rooms", lazyRoomIDs).Msg("failed to get LatestEventsInRooms")
@@ -344,6 +357,9 @@ func (c *UserCache) LazyLoadTimelines(loadPos int64, roomIDs []string, maxTimeli
 		if len(events) > 0 {
 			eventID := gjson.ParseBytes(events[0]).Get("event_id").Str
 			urd.SetPrevBatch(eventID, roomIDToPrevBatch[roomID])
+			logger.Debug().Str("prev_batch", roomIDToPrevBatch[roomID]).Str("room_id", roomID).Msg("updated prev_batch after lazy loading")
+		} else {
+			logger.Debug().Str("prev_batch", roomIDToPrevBatch[roomID]).Str("room_id", roomID).Msg("not updating prev_batch, no events")
 		}
 
 		result[roomID] = urd
@@ -462,6 +478,8 @@ func (c *UserCache) OnEphemeralEvent(roomID string, ephEvent json.RawMessage) {
 		return
 	}
 
+	c.listenersMu.Lock()
+	defer c.listenersMu.Unlock()
 	for _, l := range c.listeners {
 		l.OnRoomUpdate(update)
 	}
@@ -489,6 +507,8 @@ func (c *UserCache) OnUnreadCounts(roomID string, highlightCount, notifCount *in
 		HasCountDecreased: hasCountDecreased,
 	}
 
+	c.listenersMu.Lock()
+	defer c.listenersMu.Unlock()
 	for _, l := range c.listeners {
 		l.OnRoomUpdate(roomUpdate)
 	}
@@ -515,6 +535,8 @@ func (c *UserCache) OnSpaceUpdate(parentRoomID, childRoomID string, isDeleted bo
 		EventData:  eventData,
 	}
 
+	c.listenersMu.Lock()
+	defer c.listenersMu.Unlock()
 	for _, l := range c.listeners {
 		l.OnRoomUpdate(roomUpdate)
 	}
@@ -550,6 +572,8 @@ func (c *UserCache) OnNewEvent(eventData *EventData) {
 		EventData:  eventData,
 	}
 
+	c.listenersMu.Lock()
+	defer c.listenersMu.Unlock()
 	for _, l := range c.listeners {
 		l.OnRoomUpdate(roomUpdate)
 	}
@@ -580,6 +604,9 @@ func (c *UserCache) OnInvite(roomID string, inviteStateEvents []json.RawMessage)
 		},
 		InviteData: *inviteData,
 	}
+
+	c.listenersMu.Lock()
+	defer c.listenersMu.Unlock()
 	for _, l := range c.listeners {
 		l.OnRoomUpdate(up)
 	}
@@ -606,6 +633,9 @@ func (c *UserCache) OnLeftRoom(roomID string) {
 			userRoomData: &urd,
 		},
 	}
+
+	c.listenersMu.Lock()
+	defer c.listenersMu.Unlock()
 	for _, l := range c.listeners {
 		l.OnRoomUpdate(up)
 	}
@@ -668,6 +698,9 @@ func (c *UserCache) OnAccountData(datas []state.AccountData) {
 		}
 		c.roomToDataMu.Unlock()
 	}
+
+	c.listenersMu.Lock()
+	defer c.listenersMu.Unlock()
 	// bucket account data updates per-room and globally then invoke listeners
 	for roomID, updates := range roomUpdates {
 		if roomID == state.AccountDataGlobalRoom {
