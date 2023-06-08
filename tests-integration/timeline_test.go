@@ -689,8 +689,8 @@ func TestTimelineTxnID(t *testing.T) {
 	))
 }
 
-// Like TestTimelineTxnID, but where the user sync responds to a live update.
-func TestTimelineTxnIDDuringLiveUpdate(t *testing.T) {
+// Like TestTimelineTxnID, but where ...
+func TestTimelineTxnIDAfterInitialSync(t *testing.T) {
 	pqString := testutils.PrepareDBConnectionString()
 	// setup code
 	v2 := runTestV2Server(t)
@@ -722,6 +722,7 @@ func TestTimelineTxnIDDuringLiveUpdate(t *testing.T) {
 		NextBatch: "bob_after_initial_poll",
 	})
 
+	t.Log("Alice and Bob make initial sliding syncs.")
 	aliceRes := v3.mustDoV3Request(t, aliceToken, sync3.Request{
 		Lists: map[string]sync3.RequestList{"a": {
 			Ranges: sync3.SliceRanges{
@@ -745,24 +746,6 @@ func TestTimelineTxnIDDuringLiveUpdate(t *testing.T) {
 		},
 	})
 
-	resChan := make(chan *sync3.Response)
-	go func() {
-		t.Log("Alice requests an incremental sliding sync.")
-		resChan <- v3.mustDoV3RequestWithPos(t, aliceToken, aliceRes.Pos, sync3.Request{
-			Lists: map[string]sync3.RequestList{
-				"a": {
-					Ranges: sync3.SliceRanges{[2]int64{0, 10}},
-				},
-			},
-		})
-	}()
-
-	// We want to ensure that the sync handler is waiting for an event to give to alice
-	// before we queue messages on the pollers. The request will timeout after 20ms;
-	// sleep for half of that.
-	/// TODO: is there a better way other than a sleep?
-	time.Sleep(10 * time.Millisecond)
-
 	t.Log("Alice has sent a message... but it arrives down Bob's poller first, without a transaction_id")
 	txnID := "m1234567890"
 	newEvent := testutils.NewEvent(t, "m.room.message", alice, map[string]interface{}{"body": "hi"}, testutils.WithUnsigned(map[string]interface{}{
@@ -784,8 +767,12 @@ func TestTimelineTxnIDDuringLiveUpdate(t *testing.T) {
 	t.Log("Bob's poller sees the message.")
 	v2.waitUntilEmpty(t, bob)
 
-	// now it arrives down Alice's poller, but the event has already been persisted at this point!
-	// We need a txn ID cache to remember it.
+	t.Log("Alice requests an incremental sliding sync with no request changes.")
+	aliceRes = v3.mustDoV3RequestWithPos(t, aliceToken, aliceRes.Pos, sync3.Request{})
+	t.Log("Alice should see no messages.")
+	m.MatchResponse(t, aliceRes, m.MatchNoLists())
+
+	// Now the message arrives down Alice's poller.
 	v2.queueResponse(alice, sync2.SyncResponse{
 		Rooms: sync2.SyncRoomsResponse{
 			Join: v2JoinTimeline(roomEvents{
@@ -794,18 +781,15 @@ func TestTimelineTxnIDDuringLiveUpdate(t *testing.T) {
 			}),
 		},
 	})
-	t.Log("Alice's poller sees the message.")
+	t.Log("Alice's poller sees the message with transaction_id.")
 	v2.waitUntilEmpty(t, alice)
 
-	select {
-	case aliceRes = <-resChan:
-		t.Log("Alice's sync response includes the message with the txn ID.")
-		m.MatchResponse(t, aliceRes, m.MatchList("a", m.MatchV3Count(1)), m.MatchNoV3Ops(), m.MatchRoomSubscription(
-			roomID, m.MatchRoomTimelineMostRecent(1, []json.RawMessage{newEvent}),
-		))
-	case <-time.After(1 * time.Second):
-		t.Fatalf("Alice did not see a sync response in time.")
-	}
+	t.Log("Alice makes another incremental sync request.")
+	aliceRes = v3.mustDoV3RequestWithPos(t, aliceToken, aliceRes.Pos, sync3.Request{})
+	t.Log("Alice's sync response includes the message with the txn ID.")
+	m.MatchResponse(t, aliceRes, m.MatchList("a", m.MatchV3Count(1)), m.MatchNoV3Ops(), m.MatchRoomSubscription(
+		roomID, m.MatchRoomTimelineMostRecent(1, []json.RawMessage{newEvent}),
+	))
 
 	t.Log("Bob makes an incremental sliding sync")
 	bobRes = v3.mustDoV3RequestWithPos(t, bobToken, bobRes.Pos, sync3.Request{
