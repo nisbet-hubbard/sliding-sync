@@ -689,6 +689,139 @@ func TestTimelineTxnID(t *testing.T) {
 	))
 }
 
+// Like TestTimelineTxnID, but where the user sync responds to a live update.
+func TestTimelineTxnIDDuringLiveUpdate(t *testing.T) {
+	pqString := testutils.PrepareDBConnectionString()
+	// setup code
+	v2 := runTestV2Server(t)
+	v3 := runTestServer(t, v2, pqString)
+	defer v2.close()
+	defer v3.close()
+	roomID := "!a:localhost"
+	latestTimestamp := time.Now()
+	t.Log("Alice and Bob are in the same room")
+	room := roomEvents{
+		roomID: roomID,
+		events: append(
+			createRoomState(t, alice, latestTimestamp),
+			testutils.NewJoinEvent(t, bob),
+		),
+	}
+	v2.addAccount(t, alice, aliceToken)
+	v2.addAccount(t, bob, bobToken)
+	v2.queueResponse(alice, sync2.SyncResponse{
+		Rooms: sync2.SyncRoomsResponse{
+			Join: v2JoinTimeline(room),
+		},
+		NextBatch: "alice_after_initial_poll",
+	})
+	v2.queueResponse(bob, sync2.SyncResponse{
+		Rooms: sync2.SyncRoomsResponse{
+			Join: v2JoinTimeline(room),
+		},
+		NextBatch: "bob_after_initial_poll",
+	})
+
+	aliceRes := v3.mustDoV3Request(t, aliceToken, sync3.Request{
+		Lists: map[string]sync3.RequestList{"a": {
+			Ranges: sync3.SliceRanges{
+				[2]int64{0, 10},
+			},
+			RoomSubscription: sync3.RoomSubscription{
+				TimelineLimit: 2,
+			},
+		},
+		},
+	})
+	bobRes := v3.mustDoV3Request(t, bobToken, sync3.Request{
+		Lists: map[string]sync3.RequestList{"a": {
+			Ranges: sync3.SliceRanges{
+				[2]int64{0, 10},
+			},
+			RoomSubscription: sync3.RoomSubscription{
+				TimelineLimit: 2,
+			},
+		},
+		},
+	})
+
+	resChan := make(chan *sync3.Response)
+	go func() {
+		t.Log("Alice requests an incremental sliding sync.")
+		resChan <- v3.mustDoV3RequestWithPos(t, aliceToken, aliceRes.Pos, sync3.Request{
+			Lists: map[string]sync3.RequestList{
+				"a": {
+					Ranges: sync3.SliceRanges{[2]int64{0, 10}},
+				},
+			},
+		})
+	}()
+
+	// We want to ensure that the sync handler is waiting for an event to give to alice
+	// before we queue messages on the pollers. The request will timeout after 20ms;
+	// sleep for half of that.
+	/// TODO: is there a better way other than a sleep?
+	time.Sleep(10 * time.Millisecond)
+
+	t.Log("Alice has sent a message... but it arrives down Bob's poller first, without a transaction_id")
+	txnID := "m1234567890"
+	newEvent := testutils.NewEvent(t, "m.room.message", alice, map[string]interface{}{"body": "hi"}, testutils.WithUnsigned(map[string]interface{}{
+		"transaction_id": txnID,
+	}))
+	newEventNoUnsigned, err := sjson.DeleteBytes(newEvent, "unsigned")
+	if err != nil {
+		t.Fatalf("failed to delete bytes: %s", err)
+	}
+
+	v2.queueResponse(bob, sync2.SyncResponse{
+		Rooms: sync2.SyncRoomsResponse{
+			Join: v2JoinTimeline(roomEvents{
+				roomID: roomID,
+				events: []json.RawMessage{newEventNoUnsigned},
+			}),
+		},
+	})
+	t.Log("Bob's poller sees the message.")
+	v2.waitUntilEmpty(t, bob)
+
+	// now it arrives down Alice's poller, but the event has already been persisted at this point!
+	// We need a txn ID cache to remember it.
+	v2.queueResponse(alice, sync2.SyncResponse{
+		Rooms: sync2.SyncRoomsResponse{
+			Join: v2JoinTimeline(roomEvents{
+				roomID: roomID,
+				events: []json.RawMessage{newEvent},
+			}),
+		},
+	})
+	t.Log("Alice's poller sees the message.")
+	v2.waitUntilEmpty(t, alice)
+
+	select {
+	case aliceRes = <-resChan:
+		t.Log("Alice's sync response includes the message with the txn ID.")
+		m.MatchResponse(t, aliceRes, m.MatchList("a", m.MatchV3Count(1)), m.MatchNoV3Ops(), m.MatchRoomSubscription(
+			roomID, m.MatchRoomTimelineMostRecent(1, []json.RawMessage{newEvent}),
+		))
+	case <-time.After(1 * time.Second):
+		t.Fatalf("Alice did not see a sync response in time.")
+	}
+
+	t.Log("Bob makes an incremental sliding sync")
+	bobRes = v3.mustDoV3RequestWithPos(t, bobToken, bobRes.Pos, sync3.Request{
+		Lists: map[string]sync3.RequestList{"a": {
+			Ranges: sync3.SliceRanges{
+				[2]int64{0, 10},
+			},
+		},
+		},
+	})
+	t.Log("Bob should see the message without a transaction_id")
+	m.MatchResponse(t, bobRes, m.MatchList("a", m.MatchV3Count(1)), m.MatchNoV3Ops(), m.MatchRoomSubscription(
+		roomID, m.MatchRoomTimelineMostRecent(1, []json.RawMessage{newEventNoUnsigned}),
+	))
+}
+
 // Executes a sync v3 request without a ?pos and asserts that the count, rooms and timeline events m.Match the inputs given.
 func testTimelineLoadInitialEvents(v3 *testV3Server, token string, count int, wantRooms []roomEvents, numTimelineEventsPerRoom int) func(t *testing.T) {
 	return func(t *testing.T) {
