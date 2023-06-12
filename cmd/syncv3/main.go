@@ -14,6 +14,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -39,6 +40,7 @@ const (
 	EnvJaeger     = "SYNCV3_JAEGER_URL"
 	EnvSentryDsn  = "SYNCV3_SENTRY_DSN"
 	EnvLogLevel   = "SYNCV3_LOG_LEVEL"
+	EnvTxnIDGrace = "SYNCV3_TXNID_GRACE_PERIOD"
 )
 
 var helpMsg = fmt.Sprintf(`
@@ -80,6 +82,7 @@ func main() {
 		EnvJaeger:     os.Getenv(EnvJaeger),
 		EnvSentryDsn:  os.Getenv(EnvSentryDsn),
 		EnvLogLevel:   os.Getenv(EnvLogLevel),
+		EnvTxnIDGrace: os.Getenv(EnvTxnIDGrace),
 	}
 	requiredEnvVars := []string{EnvServer, EnvDB, EnvSecret, EnvBindAddr}
 	for _, requiredEnvVar := range requiredEnvVars {
@@ -161,9 +164,20 @@ func main() {
 		panic(err)
 	}
 
-	h2, h3 := syncv3.Setup(args[EnvServer], args[EnvDB], args[EnvSecret], syncv3.Opts{
-		AddPrometheusMetrics: args[EnvPrometheus] != "",
-	})
+	v3Opts := syncv3.Opts{
+		AddPrometheusMetrics:   args[EnvPrometheus] != "",
+		TxnIDGraceMilliseconds: 500,
+	}
+	if args[EnvTxnIDGrace] != "" {
+		value, err := strconv.ParseUint(args[EnvTxnIDGrace], 10, 64)
+		if err != nil {
+			fmt.Printf("Warning: %s is not a positive integer, using %d", EnvTxnIDGrace, v3Opts.TxnIDGraceMilliseconds)
+		} else {
+			v3Opts.TxnIDGraceMilliseconds = value
+		}
+	}
+
+	h2, h3 := syncv3.Setup(args[EnvServer], args[EnvDB], args[EnvSecret], v3Opts)
 
 	go h2.StartV2Pollers()
 	if args[EnvJaeger] != "" {

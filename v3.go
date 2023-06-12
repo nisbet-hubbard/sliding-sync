@@ -36,6 +36,14 @@ type Opts struct {
 	// if true, publishing messages will block until the consumer has consumed it.
 	// Assumes a single producer and a single consumer.
 	TestingSynchronousPubsub bool
+	// TxnIDGraceMilliseconds is the maximum time that we will delay a live update when
+	// we lack a transaction_id for an event.
+	//
+	// The reason we need a delay at all: if Alice sends a message with transaction_id
+	// "abc" but Bob's poller sees it first, we want to delay the live update to Alice
+	// for that event until Alice has seen it on her poller and we have a
+	// transaction ID to give to Alice. (Otherwise the "local echo" is broken.)
+	TxnIDGraceMilliseconds uint64
 }
 
 type server struct {
